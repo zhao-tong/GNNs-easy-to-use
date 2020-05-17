@@ -15,12 +15,12 @@ class GNNs(object):
         self.lr = lr
         self.weight_decay = weight_decay
         self.n_epochs = epochs
-        # disable logger if wanted
-        if not log:
-            logging.disable(logging.CRITICAL)
-            name = None
         # create a logger, logs are saved to GNN-[name].log when name is not None
-        self.logger = self.get_logger(name)
+        if log:
+            self.logger = self.get_logger(name)
+        else:
+            # disable logger if wanted
+            self.logger = logging.getLogger()
         # config device (force device to cpu when cuda is not available)
         if not torch.cuda.is_available():
             cuda = -1
