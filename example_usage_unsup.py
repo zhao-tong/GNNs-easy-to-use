@@ -2,7 +2,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.metrics import f1_score
 from sklearn.linear_model import LogisticRegression
-from GNNs import GNN
+from GNNs_unsupervised import GNN
 
 def example_with_cora():
     """load cora dataset"""

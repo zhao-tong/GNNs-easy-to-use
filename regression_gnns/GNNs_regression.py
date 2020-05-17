@@ -33,7 +33,7 @@ class GNNs(object):
         # setup the model
         self.model = GNN(self.features.size(1),
                          hidden_size,
-                         self.n_class,
+                         self.dim_out,
                          n_layers,
                          F.relu,
                          dropout,
@@ -69,14 +69,13 @@ class GNNs(object):
             self.adj = torch.FloatTensor(adj_matrix.todense())
         # labels (torch.LongTensor) and train/validation/test nids (np.ndarray)
         if isinstance(labels, np.ndarray):
-            labels = torch.LongTensor(labels)
+            labels = torch.FloatTensor(labels)
         self.labels = labels
-        assert len(labels.size()) == 1
         self.train_nid = tvt_nids[0]
         self.val_nid = tvt_nids[1]
         self.test_nid = tvt_nids[2]
         # number of classes
-        self.n_class = len(torch.unique(self.labels))
+        self.dim_out = self.labels.size(1)
 
     def fit(self):
         """ train the model """
@@ -88,38 +87,39 @@ class GNNs(object):
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=self.lr,
                                      weight_decay=self.weight_decay)
-        # keep record of the best validation accuracy for early stopping
-        best_val_acc = 0.
+        # keep record of the best validation loss for early stopping
+        best_val_loss = np.inf
         # train model
+        mse = nn.MSELoss()
         for epoch in range(self.n_epochs):
             model.train()
-            nc_logits = model(adj, features)
+            logits = model(adj, features)
             # losses
-            loss = F.nll_loss(nc_logits[self.train_nid], labels[self.train_nid])
+            loss = mse(logits[self.train_nid], labels[self.train_nid])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             # validate (without dropout)
             self.model.eval()
             with torch.no_grad():
-                nc_logits_eval = model(adj, features)
-            val_acc = self.eval_node_cls(nc_logits_eval[self.val_nid], labels[self.val_nid])
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                test_acc = self.eval_node_cls(nc_logits_eval[self.test_nid], labels[self.test_nid])
-                self.logger.info('Epoch [{:3}/{}]: loss {:.4f}, val acc {:.4f}, test acc {:.4f}'
-                            .format(epoch+1, self.n_epochs, loss.item(), val_acc, test_acc))
+                logits_eval = model(adj, features)
+            val_loss = mse(logits_eval[self.val_nid], labels[self.val_nid])
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                test_loss = mse(logits_eval[self.test_nid], labels[self.test_nid])
+                self.logger.info('Epoch [{:3}/{}]: train loss {:.4f}, val loss {:.4f}, test loss {:.4f}'
+                            .format(epoch+1, self.n_epochs, loss.item(), val_loss, test_loss))
             else:
-                self.logger.info('Epoch [{:3}/{}]: loss {:.4f}, val acc {:.4f}'
-                            .format(epoch+1, self.n_epochs, loss.item(), val_acc))
+                self.logger.info('Epoch [{:3}/{}]: train loss {:.4f}, val loss {:.4f}'
+                            .format(epoch+1, self.n_epochs, loss.item(), val_loss))
         # get final test result without early stop
         with torch.no_grad():
-            nc_logits_eval = model(adj, features)
-        test_acc_final = self.eval_node_cls(nc_logits_eval[self.test_nid], labels[self.test_nid])
+            logits_eval = model(adj, features)
+        test_acc_final = mse(logits_eval[self.test_nid], labels[self.test_nid])
         # log both results
-        self.logger.info('Final test acc with early stop: {:.4f}, without early stop: {:.4f}'
-                    .format(test_acc, test_acc_final))
-        return test_acc
+        self.logger.info('Final test loss with early stop: {:.4f}, without early stop: {:.4f}'
+                    .format(test_loss, test_acc_final))
+        return test_loss
 
     def log_parameters(self, all_vars):
         """ log all variables in the input dict excluding the following ones """
@@ -129,14 +129,6 @@ class GNNs(object):
         del all_vars['labels']
         del all_vars['tvt_nids']
         self.logger.info(f'Parameters: {all_vars}')
-
-    @staticmethod
-    def eval_node_cls(nc_logits, labels):
-        """ evaluate node classification results """
-        preds = torch.argmax(nc_logits, dim=1)
-        correct = torch.sum(preds == labels)
-        acc = correct.item() / len(labels)
-        return acc
 
     @staticmethod
     def get_logger(name):
@@ -164,7 +156,7 @@ class GNNs(object):
 
 class GNN(nn.Module):
     """ GNN as node classification model """
-    def __init__(self, dim_feats, dim_h, n_classes, n_layers, activation, dropout, gnnlayer_type='gcn'):
+    def __init__(self, dim_feats, dim_h, dim_out, n_layers, activation, dropout, gnnlayer_type='gcn'):
         super(GNN, self).__init__()
         heads = [1] * (n_layers + 1)
         if gnnlayer_type == 'gcn':
@@ -182,13 +174,13 @@ class GNN(nn.Module):
         for i in range(n_layers - 1):
             self.layers.append(gnnlayer(dim_h*heads[i], dim_h, heads[i+1], activation, dropout))
         # output layer
-        self.layers.append(gnnlayer(dim_h*heads[-2], n_classes, heads[-1], None, dropout))
+        self.layers.append(gnnlayer(dim_h*heads[-2], dim_out, heads[-1], None, dropout))
 
     def forward(self, adj, features):
         h = features
         for layer in self.layers:
             h = layer(adj, h)
-        return F.log_softmax(h, dim=1)
+        return h
 
 
 class GCNLayer(nn.Module):

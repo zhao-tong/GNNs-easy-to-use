@@ -1,8 +1,230 @@
+import sys
+import math
+import copy
 import random
+from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
+from scipy.sparse import csr_matrix
+
+class GNN(object):
+    """Graph Neural Networks that can be easily called and used.
+
+    Authors of this code package:
+    Tong Zhao, tzhao2@nd.edu
+    Tianwen Jiang, twjiang@ir.hit.edu.cn
+
+    Last updated: 11/25/2019
+
+    Parameters
+    ----------
+    adj_matrix: scipy.sparse.csr_matrix
+        The adjacency matrix of the graph, where nonzero entries indicates edges.
+        The number of each nonzero entry indicates the number of edges between these two nodes.
+
+    features: numpy.ndarray, optional
+        The 2-dimension np array that stores given raw feature of each node, where the i-th row
+        is the raw feature vector of node i.
+        When raw features are not given, one-hot degree features will be used.
+
+    labels: list or 1-D numpy.ndarray, optional
+        The class label of each node. Used for supervised learning.
+
+    supervised: bool, optional, default False
+        Whether to use supervised learning.
+
+    model: {'gat', 'graphsage'}, default 'gat'
+        The GNN model to be used.
+        - 'graphsage' is GraphSAGE: https://cs.stanford.edu/people/jure/pubs/graphsage-nips17.pdf
+        - 'gat' is graph attention network: https://arxiv.org/pdf/1710.10903.pdf
+
+    n_layer: int, optional, default 2
+        Number of layers in the GNN
+
+    emb_size: int, optional, default 128
+        Size of the node embeddings to be learnt
+
+    random_state, int, optional, default 1234
+        Random seed
+
+    device: {'cpu', 'cuda', 'auto'}, default 'auto'
+        The device to use.
+
+    epochs: int, optional, default 5
+        Number of epochs for training
+
+    batch_size: int, optional, default 20
+        Number of node per batch for training
+
+    lr: float, optional, default 0.7
+        Learning rate
+
+    unsup_loss_type: {'margin', 'normal'}, default 'margin'
+        Loss function to be used for unsupervised learning
+        - 'margin' is a hinge loss with margin of 3
+        - 'normal' is the unsupervised loss function described in the paper of GraphSAGE
+
+    print_progress: bool, optional, default True
+        Whether to print the training progress
+    """
+    def __init__(self, adj_matrix, features=None, labels=None, supervised=False, model='gat', n_layer=2, emb_size=128, random_state=1234, device='auto', epochs=5, batch_size=20, lr=0.7, unsup_loss_type='margin', print_progress=True):
+        super(GNN, self).__init__()
+        # fix random seeds
+        random.seed(random_state)
+        np.random.seed(random_state)
+        torch.manual_seed(random_state)
+        torch.cuda.manual_seed_all(random_state)
+        # set parameters
+        self.supervised = supervised
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.unsup_loss_type = unsup_loss_type
+        self.print_progress = print_progress
+        self.gat = False
+        self.gcn = False
+        if model == 'gat':
+            self.gat = True
+            self.model_name = 'GAT'
+        elif model == 'gcn':
+            self.gcn = True
+            self.model_name = 'GCN'
+        else:
+            self.model_name = 'GraphSAGE'
+        # set device
+        if device == 'auto':
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+
+        # load data
+        self.dl = DataLoader(adj_matrix, features, labels, supervised, self.device)
+
+        self.gnn = GNN_model(n_layer, emb_size, self.dl, self.device, gat=self.gat, gcn=self.gcn)
+        self.gnn.to(self.device)
+
+        if supervised:
+            n_classes = len(set(labels))
+            self.classification = Classification(emb_size, n_classes)
+            self.classification.to(self.device)
+
+    def fit(self):
+        train_nodes = copy.deepcopy(self.dl.nodes_train)
+
+        if self.supervised:
+            labels = self.dl.labels
+            models = [self.gnn, self.classification]
+        else:
+            unsup_loss = Unsup_Loss(self.dl, self.device)
+            models = [self.gnn]
+            if self.unsup_loss_type == 'margin':
+                num_neg = 6
+            elif self.unsup_loss_type == 'normal':
+                num_neg = 100
+
+        for epoch in range(self.epochs):
+            np.random.shuffle(train_nodes)
+
+            params = []
+            for model in models:
+                for param in model.parameters():
+                    if param.requires_grad:
+                        params.append(param)
+            optimizer = torch.optim.SGD(params, lr=self.lr)
+            optimizer.zero_grad()
+            for model in models:
+                model.zero_grad()
+
+            batches = math.ceil(len(train_nodes) / self.batch_size)
+            visited_nodes = set()
+            if self.print_progress:
+                tqdm_bar = tqdm(range(batches), ascii=True, leave=False)
+            else:
+                tqdm_bar = range(batches)
+            for index in tqdm_bar:
+                if not self.supervised and len(visited_nodes) == len(train_nodes):
+                    # finish this epoch if all nodes are visited
+                    if self.print_progress:
+                        tqdm_bar.close()
+                    break
+                nodes_batch = train_nodes[index*self.batch_size:(index+1)*self.batch_size]
+                # extend nodes batch for unspervised learning
+                if not self.supervised:
+                    nodes_batch = np.asarray(list(unsup_loss.extend_nodes(nodes_batch, num_neg=num_neg)))
+                visited_nodes |= set(nodes_batch)
+                # feed nodes batch to the GNN and returning the nodes embeddings
+                embs_batch = self.gnn(nodes_batch)
+                # calculate loss
+                if self.supervised:
+                    # superivsed learning
+                    logists = self.classification(embs_batch)
+                    labels_batch = labels[nodes_batch]
+                    loss_sup = -torch.sum(logists[range(logists.size(0)), labels_batch], 0)
+                    loss_sup /= len(nodes_batch)
+                    loss = loss_sup
+                else:
+                    # unsupervised learning
+                    if self.unsup_loss_type == 'margin':
+                        loss_net = unsup_loss.get_loss_margin(embs_batch, nodes_batch)
+                    elif self.unsup_loss_type == 'normal':
+                        loss_net = unsup_loss.get_loss_sage(embs_batch, nodes_batch)
+                    loss = loss_net
+
+                if self.print_progress:
+                    progress_message = '{} Epoch: [{}/{}], current loss: {:.4f}, touched nodes [{}/{}] '.format(
+                                    self.model_name, epoch+1, self.epochs, loss.item(), len(visited_nodes), len(train_nodes))
+                    tqdm_bar.set_description(progress_message)
+
+                loss.backward()
+                for model in models:
+                    nn.utils.clip_grad_norm_(model.parameters(), 5)
+                optimizer.step()
+                optimizer.zero_grad()
+                for model in models:
+                    model.zero_grad()
+
+    def generate_embeddings(self):
+        nodes = self.dl.nodes_train
+        b_sz = 500
+        batches = math.ceil(len(nodes) / b_sz)
+        embs = []
+        for index in range(batches):
+            nodes_batch = nodes[index*b_sz:(index+1)*b_sz]
+            with torch.no_grad():
+                embs_batch = self.gnn(nodes_batch)
+            assert len(embs_batch) == len(nodes_batch)
+            embs.append(embs_batch)
+        assert len(embs) == batches
+        embs = torch.cat(embs, 0)
+        assert len(embs) == len(nodes)
+        return embs.cpu().numpy()
+
+    def predict(self):
+        if not self.supervised:
+            print('GNN.predict() is only supported for supervised learning.')
+            sys.exit(0)
+        nodes = self.dl.nodes_train
+        b_sz = 500
+        batches = math.ceil(len(nodes) / b_sz)
+        preds = []
+        for index in range(batches):
+            nodes_batch = nodes[index*b_sz:(index+1)*b_sz]
+            with torch.no_grad():
+                embs_batch = self.gnn(nodes_batch)
+                logists = self.classification(embs_batch)
+                _, predicts = torch.max(logists, 1)
+                preds.append(predicts)
+        assert len(preds) == batches
+        preds = torch.cat(preds, 0)
+        assert len(preds) == len(nodes)
+        return preds.cpu().numpy()
+
+    def release_cuda_cache(self):
+        torch.cuda.empty_cache()
+
 
 class DataLoader(object):
     def __init__(self, adj_matrix, raw_features, labels, supervised, device):
@@ -68,9 +290,9 @@ class Unsup_Loss(object):
 
         self.target_nodes = None
         self.positive_pairs = []
-        self.negtive_pairs = []
+        self.negative_pairs = []
         self.node_positive_pairs = {}
-        self.node_negtive_pairs = {}
+        self.node_negative_pairs = {}
         self.unique_nodes_batch = []
 
     def get_loss_sage(self, embeddings, nodes):
@@ -79,10 +301,10 @@ class Unsup_Loss(object):
         node2index = {n:i for i,n in enumerate(self.unique_nodes_batch)}
 
         nodes_score = []
-        assert len(self.node_positive_pairs) == len(self.node_negtive_pairs)
+        assert len(self.node_positive_pairs) == len(self.node_negative_pairs)
         for node in self.node_positive_pairs:
             pps = self.node_positive_pairs[node]
-            nps = self.node_negtive_pairs[node]
+            nps = self.node_negative_pairs[node]
             if len(pps) == 0 or len(nps) == 0:
                 continue
 
@@ -111,10 +333,10 @@ class Unsup_Loss(object):
         node2index = {n:i for i,n in enumerate(self.unique_nodes_batch)}
 
         nodes_score = []
-        assert len(self.node_positive_pairs) == len(self.node_negtive_pairs)
+        assert len(self.node_positive_pairs) == len(self.node_negative_pairs)
         for node in self.node_positive_pairs:
             pps = self.node_positive_pairs[node]
-            nps = self.node_negtive_pairs[node]
+            nps = self.node_negative_pairs[node]
             if len(pps) == 0 or len(nps) == 0:
                 continue
 
@@ -138,21 +360,21 @@ class Unsup_Loss(object):
     def extend_nodes(self, nodes, num_neg=6):
         self.positive_pairs = []
         self.node_positive_pairs = {}
-        self.negtive_pairs = []
-        self.node_negtive_pairs = {}
+        self.negative_pairs = []
+        self.node_negative_pairs = {}
 
         self.target_nodes = nodes
         self.get_positive_nodes(nodes)
-        self.get_negtive_nodes(nodes, num_neg)
+        self.get_negative_nodes(nodes, num_neg)
         self.unique_nodes_batch = list(set([i for x in self.positive_pairs for i in x])
-                                       | set([i for x in self.negtive_pairs for i in x]))
+                                       | set([i for x in self.negative_pairs for i in x]))
         assert set(self.target_nodes) < set(self.unique_nodes_batch)
         return self.unique_nodes_batch
 
     def get_positive_nodes(self, nodes):
         return self._run_random_walks(nodes)
 
-    def get_negtive_nodes(self, nodes, num_neg):
+    def get_negative_nodes(self, nodes, num_neg):
         for node in nodes:
             neighbors = set([node])
             frontier = set([node])
@@ -164,9 +386,9 @@ class Unsup_Loss(object):
                 neighbors |= current
             far_nodes = set(self.train_nodes) - neighbors
             neg_samples = random.sample(far_nodes, num_neg) if num_neg < len(far_nodes) else far_nodes
-            self.negtive_pairs.extend([(node, neg_node) for neg_node in neg_samples])
-            self.node_negtive_pairs[node] = [(node, neg_node) for neg_node in neg_samples]
-        return self.negtive_pairs
+            self.negative_pairs.extend([(node, neg_node) for neg_node in neg_samples])
+            self.node_negative_pairs[node] = [(node, neg_node) for neg_node in neg_samples]
+        return self.negative_pairs
 
     def _run_random_walks(self, nodes):
         for node in nodes:
@@ -196,14 +418,15 @@ class SageLayer(nn.Module):
     """
     Encodes a node's using 'convolutional' GraphSage approach
     """
-    def __init__(self, input_size, out_size, gat=False):
+    def __init__(self, input_size, out_size, gat=False, gcn=False):
         super(SageLayer, self).__init__()
 
         self.input_size = input_size
         self.out_size = out_size
 
         self.gat = gat
-        self.weight = nn.Parameter(torch.FloatTensor(out_size, self.input_size if self.gat else 2 * self.input_size))
+        self.gcn = gcn
+        self.weight = nn.Parameter(torch.FloatTensor(out_size, self.input_size if self.gat or self.gcn else 2 * self.input_size))
 
         self.init_params()
 
@@ -216,10 +439,10 @@ class SageLayer(nn.Module):
         Generates embeddings for a batch of nodes.
         nodes	 -- list of nodes
         """
-        if not self.gat:
-            combined = torch.cat([self_feats, aggregate_feats], dim=1)
-        else:
+        if self.gat or self.gcn:
             combined = aggregate_feats
+        else:
+            combined = torch.cat([self_feats, aggregate_feats], dim=1)
         combined = F.relu(self.weight.mm(combined.t())).t()
         return combined
 
@@ -241,15 +464,16 @@ class Attention(nn.Module):
         e = att(torch.cat((row_embs, col_embs), dim=1))
         return F.leaky_relu(e, negative_slope=0.2)
 
-class GraphSage(nn.Module):
+class GNN_model(nn.Module):
     """docstring for GraphSage"""
-    def __init__(self, num_layers, out_size, dl, device, gat=False, agg_func='MEAN'):
-        super(GraphSage, self).__init__()
+    def __init__(self, num_layers, out_size, dl, device, gat=False, gcn=False, agg_func='MEAN'):
+        super(GNN_model, self).__init__()
 
         self.input_size = dl.features.size(1)
         self.out_size = out_size
         self.num_layers = num_layers
         self.gat = gat
+        self.gcn = gcn
         self.device = device
         self.agg_func = agg_func
 
@@ -259,7 +483,7 @@ class GraphSage(nn.Module):
 
         for index in range(1, num_layers+1):
             layer_size = out_size if index != 1 else self.input_size
-            setattr(self, 'sage_layer'+str(index), SageLayer(layer_size, out_size, gat=self.gat))
+            setattr(self, 'sage_layer'+str(index), SageLayer(layer_size, out_size, gat=self.gat, gcn=self.gcn))
         if self.gat:
             self.attention = Attention(self.input_size, out_size)
 
@@ -298,11 +522,11 @@ class GraphSage(nn.Module):
     def _get_unique_neighs_list(self, nodes, num_sample=10):
         _set = set
         to_neighs = [self.adj_lists[int(node)] for node in nodes]
-        if not num_sample is None:
+        if self.gcn or self.gat:
+            samp_neighs = to_neighs
+        else:
             _sample = random.sample
             samp_neighs = [_set(_sample(to_neigh, num_sample)) if len(to_neigh) >= num_sample else to_neigh for to_neigh in to_neighs]
-        else:
-            samp_neighs = to_neighs
         samp_neighs = [samp_neigh | set([nodes[i]]) for i, samp_neigh in enumerate(samp_neighs)]
         _unique_nodes_list = list(set.union(*samp_neighs))
         i = list(range(len(_unique_nodes_list)))
@@ -316,7 +540,7 @@ class GraphSage(nn.Module):
         assert len(nodes) == len(samp_neighs)
         indicator = [(nodes[i] in samp_neighs[i]) for i in range(len(samp_neighs))]
         assert False not in indicator
-        if not self.gat:
+        if not self.gat and not self.gcn:
             samp_neighs = [(samp_neighs[i]-set([nodes[i]])) for i in range(len(samp_neighs))]
         if len(pre_hidden_embs) == len(unique_nodes):
             embed_matrix = pre_hidden_embs
@@ -328,13 +552,13 @@ class GraphSage(nn.Module):
         # get the edge counts for each edge
         edge_counts = self.adj_matrix[nodes][:, unique_nodes_list].toarray()
         edge_counts = torch.FloatTensor(edge_counts).to(embed_matrix.device)
+        torch.sqrt_(edge_counts)
         if self.gat:
             indices = (torch.LongTensor(row_indices), torch.LongTensor(column_indices))
             nodes_indices = torch.LongTensor([unique_nodes[nodes[n]] for n in row_indices])
             row_embs = embed_matrix[nodes_indices]
             col_embs = embed_matrix[column_indices]
             atts = self.attention(row_embs, col_embs).squeeze()
-            # mask = torch.sparse.FloatTensor(indices, atts, size=(len(samp_neighs),len(unique_nodes))).to_dense()
             mask = torch.zeros(len(samp_neighs), len(unique_nodes)).to(embed_matrix.device)
             mask.index_put_(indices, atts)
             mask = mask * edge_counts

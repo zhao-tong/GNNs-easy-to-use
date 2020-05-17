@@ -1,21 +1,24 @@
-## A PyTorch implementation of GraphSAGE and GAT
+## A PyTorch GNNs
 
-This package contains a easy-to-use PyTorch implementation of [GraphSAGE](http://snap.stanford.edu/graphsage/) and [Graph Attention Network](https://arxiv.org/pdf/1710.10903.pdf). It can be easily imported and used like using logistic regression from sklearn. This package is built upon our [GraphSAGE-pytorch](https://github.com/twjiang/graphSAGE-pytorch) implementation.
+This package contains a easy-to-use PyTorch implementation of [GCN](https://arxiv.org/pdf/1609.02907.pdf), [GraphSAGE](http://snap.stanford.edu/graphsage/), and [Graph Attention Network](https://arxiv.org/pdf/1710.10903.pdf). It can be easily imported and used like using logistic regression from sklearn. Two versions for supervised GNNs are provided: one implemented with only PyTorch, the other implemented with DGL and PyTorch.
+
+Note: The unsupervised version is built upon our [GraphSAGE-pytorch](https://github.com/twjiang/graphSAGE-pytorch) implementation, and the DGL version is built upon the examples given by [DGL](https://github.com/dmlc/dgl/tree/master/examples/pytorch).
 
 #### Authors of this code package:
 [Tong Zhao](https://github.com/zhao-tong) (tzhao2@nd.edu),
 [Tianwen Jiang](https://github.com/twjiang) (tjiang2@nd.edu).
 
 
-## Environment settings
+## Important dependencies
 
 - python==3.6.8
 - pytorch==1.0.1.post2
+- dgl==0.4.2
 
 
 ## Usage
 
-**Parameters:**
+**Parameters (GNNs_unsupervised):**
 ```
 adj_matrix: scipy.sparse.csr_matrix
     The adjacency matrix of the graph, where nonzero entries indicates edges.
@@ -68,14 +71,17 @@ print_progress: bool, optional, default True
 ```
 **Example Usage**
 
-A detailed example of usage under different settings on the Cora dataset can be found in `example_usage.py`
+A detailed example of usage for unsupervised GNNs under different settings on the Cora dataset can be found in `example_usage.py`
 
 To run the unsupervised GraphSAGE on Cuda:
 ```python
-from GNNs import GNN
+from GNNs_unsupervised import GNN
 gnn = GNN(adj_matrix, features=raw_features, supervised=False, model='graphsage', device='cuda')
 # train the model
 gnn.fit()
 # get the node embeddings with the trained model
 embs = gnn.generate_embeddings()
 ```
+
+**TODO**
+Docs and examples for supervised GNNs will be added soon.
